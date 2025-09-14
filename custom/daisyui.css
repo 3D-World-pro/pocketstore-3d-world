@@ -1,0 +1,9 @@
+@plugin "daisyui/theme" {
+    name: "light";
+    default: true;
+    --color-primary: rgba(42, 123, 155, 1);
+    --color-secondary: rgba(237, 221, 83, 1);
+    --color-secondary-content: black;
+    --color-neutral: white;
+    --color-neutral-content: black;
+}
