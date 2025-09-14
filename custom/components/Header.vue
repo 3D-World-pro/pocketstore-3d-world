@@ -3,18 +3,19 @@
     <div class="flex justify-between">
       <section class="logo">
         <a href="/">
-          3d-world.pro
+          <img src="/3d-world-pro-black.svg" alt="" class="w-2/3">
         </a>
       </section>
       <section>
         <nav>
-          <ul>
-            <li><a href="/">Test</a></li>
-          </ul>
+          <Bars />
         </nav>
       </section>
     </div>
   </section>
+  <Context />
 </template>
 <script setup lang="ts">
+import Bars from "@/components/header/mobile/Bars.vue";
+import Context from "../../storefront/components/header/mobile/Context.vue";
 </script>
