@@ -1,0 +1,16 @@
+{
+    "name": "3D-world.pro",
+    "short_name": "3d-world.pro",
+    "description": "My Awesome Nuxt 3 Application",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#000",
+    "theme_color": "#1f6fed",
+    "icons": [
+        {
+            "src": "/3dworld-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        }
+    ]
+}
