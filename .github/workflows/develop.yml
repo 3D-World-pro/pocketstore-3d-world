@@ -23,10 +23,12 @@ jobs:
             git pull
             git checkout develop
             go run bin/extend.go
+            go run bin/translations.go
             cd storefront
-            go run bin/lang.go
             npm i
+            bun run vitest
+            bun run lint
             npm run build
             cd ..
-            docker compose down
+            docker compose stop
             docker compose -f docker-compose.develop.yml up -d
