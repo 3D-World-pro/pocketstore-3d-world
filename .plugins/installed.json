@@ -106,17 +106,5 @@
     "name": "hello-world",
     "vendor": "pocketstore-io",
     "revision": "0.0.1.2"
-  },
-  {
-    "version": "latest",
-    "name": "image-slider",
-    "vendor": "pocketstore-io",
-    "revision": "22771aa0c2bed1423002d71634dfcb19915f0011"
-  },
-  {
-    "version": "latest",
-    "name": "product-reviews",
-    "vendor": "pocketstore-io",
-    "revision": "42a4a5dd093989f9edb13635f5cea7e17cc13528"
   }
 ]
