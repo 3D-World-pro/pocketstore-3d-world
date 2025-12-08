@@ -2,9 +2,12 @@ storefront
 
 .plugins/cache
 .plugins/repos
+.plugins/audit
 
 # Ignore Jetbrains Idea Folder
 .idea
 
 # Ignore node dependencies
 node_modules
+
+.env

@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,11 +19,16 @@ type Plugin struct {
 	Name     string `json:"name"`
 	Vendor   string `json:"vendor"`
 	Prio     int    `json:"prio,omitempty"`
+	Revision string `json:"revision,omitempty"` // include revision in installed.json
 	BasePath string `json:"-"`
+	Source   string `json:"-"` // Track source: "baseline", "custom", "storefront", or parent plugin key
 }
 
 type PluginJson struct {
-	Prio int `json:"prio"`
+	Prio         int      `json:"prio"`
+	Revision     string   `json:"revision,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	Requirements []string `json:"requirements,omitempty"`
 }
 
 var (
@@ -49,18 +55,43 @@ func exists(path string) bool {
 	return err == nil
 }
 
-// readPrio reads the priority from a plugin.json file
-func readPrio(jsonPath string) int {
-	file, err := os.Open(jsonPath)
+// readPluginMeta reads plugin.json and returns PluginJson metadata
+func readPluginMeta(vendor, name string) (PluginJson, error) {
+	pluginPath := filepath.Join(".plugins", "repos", vendor, name, "plugin.json")
+	file, err := os.Open(pluginPath)
 	if err != nil {
-		return 0
+		return PluginJson{}, err
 	}
 	defer file.Close()
 	var pj PluginJson
 	if err := json.NewDecoder(file).Decode(&pj); err != nil {
+		return PluginJson{}, err
+	}
+	return pj, nil
+}
+
+// readPrio reads the priority from a plugin.json file (keeps legacy name)
+func readPrio(vendor, name string) int {
+	pj, err := readPluginMeta(vendor, name)
+	if err != nil {
 		return 0
 	}
 	return pj.Prio
+}
+
+// parsePluginURL extracts vendor and name from URLs like:
+// "github.com/pocketstore-io/plugin-image-slider" -> ("pocketstore-io", "image-slider")
+// "github.com/pocketstore-io/reviews" -> ("pocketstore-io", "reviews")
+func parsePluginURL(url string) (vendor, name string, ok bool) {
+	parts := strings.Split(url, "/")
+	if len(parts) < 3 {
+		return "", "", false
+	}
+	vendor = parts[len(parts)-2]
+	name = parts[len(parts)-1]
+	// Remove "plugin-" prefix if present
+	name = strings.TrimPrefix(name, "plugin-")
+	return vendor, name, true
 }
 
 // copyDir recursively copies a directory
@@ -100,34 +131,29 @@ func copyFile(src, dst string) error {
 }
 
 // DownloadFile downloads a file from the given URL and saves it to the given filepath
-func DownloadFile(filepathDest string, url string) error {
-	fmt.Printf("[debug] DownloadFile called: url=%s dest=%s\n", url, filepathDest)
+// returns the HTTP status code and an error (if any)
+func DownloadFile(filepathDest string, url string) (int, error) {
 	out, err := os.Create(filepathDest)
 	if err != nil {
-		fmt.Printf("[error] failed to create file %s: %v\n", filepathDest, err)
-		return err
+		return 0, err
 	}
 	defer out.Close()
 
 	resp, err := http.Get(url)
 	if err != nil {
-		fmt.Printf("[error] http.Get failed for %s: %v\n", url, err)
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
-	fmt.Printf("[debug] http.Get response status: %s for url=%s\n", resp.Status, url)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
+	status := resp.StatusCode
+	if status != http.StatusOK {
+		return status, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	written, err := io.Copy(out, resp.Body)
-	if err != nil {
-		fmt.Printf("[error] io.Copy failed while writing %s: %v\n", filepathDest, err)
-		return err
+	if _, err = io.Copy(out, resp.Body); err != nil {
+		return status, err
 	}
-	fmt.Printf("[debug] DownloadFile wrote %d bytes to %s\n", written, filepathDest)
-	return nil
+	return status, nil
 }
 
 // Unzip extracts a zip archive to a specified destination
@@ -197,20 +223,14 @@ func Unzip(src, dest string) error {
 // FetchLatestVersion queries the plugin API for the latest version string
 func FetchLatestVersion(vendor, name string) (string, error) {
 	url := fmt.Sprintf("https://download.pocketstore.io/d/plugins/%s/%s/latest.zip", vendor, name)
-	fmt.Printf("[debug] FetchLatestVersion HEAD %s\n", url)
 	resp, err := http.Head(url)
 	if err != nil {
-		fmt.Printf("[error] http.Head failed for %s: %v\n", url, err)
 		return "", err
 	}
 	defer resp.Body.Close()
-
-	fmt.Printf("[debug] HEAD response status for %s: %s\n", url, resp.Status)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("failed to fetch latest: %s", resp.Status)
 	}
-
-	// Just return "latest"
 	return "latest", nil
 }
 
@@ -220,15 +240,235 @@ func isSpecialLatestVersion(version string) bool {
 	if version == "latest" {
 		return true
 	}
-	// Match version pattern like 0.0.1.3 (four numbers separated by dots)
 	matched, _ := regexp.MatchString(`^\d+\.\d+\.\d+\.\d+$`, version)
 	return matched
 }
 
-// Step 1: mergePlugins merges baseline and custom plugins into a unique list
-func mergePlugins() error {
-	fmt.Println("==> Step 1: Merging plugins")
+// tryReadGitHead tries to read a commit hash from a .git directory inside pluginDir
+// returns "" if not found or any error occurs.
+func tryReadGitHead(pluginDir string) string {
+	gitHeadPath := filepath.Join(pluginDir, ".git", "HEAD")
+	b, err := os.ReadFile(gitHeadPath)
+	if err != nil {
+		// no .git/HEAD present
+		return ""
+	}
+	head := strings.TrimSpace(string(b))
+	// If HEAD is a ref, try to read the ref file
+	if strings.HasPrefix(head, "ref: ") {
+		ref := strings.TrimPrefix(head, "ref: ")
+		refPath := filepath.Join(pluginDir, ".git", filepath.FromSlash(ref))
+		if rb, err := os.ReadFile(refPath); err == nil {
+			return strings.TrimSpace(string(rb))
+		}
+		// try packed-refs fallback
+		packedPath := filepath.Join(pluginDir, ".git", "packed-refs")
+		if pb, err := os.ReadFile(packedPath); err == nil {
+			lines := strings.Split(string(pb), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				parts := strings.Fields(line)
+				if len(parts) == 2 && parts[1] == ref {
+					return parts[0]
+				}
+			}
+		}
+		return ""
+	}
+	// HEAD contains a raw commit SHA
+	if head != "" {
+		return head
+	}
+	return ""
+}
 
+// computeDirSHA1 computes a SHA1 over the files contained in dir in a deterministic way
+// Returns hex-encoded sha1. This is used as a fallback "commit-like" identifier when no
+// revision is provided by plugin.json and no .git data is present.
+func computeDirSHA1(dir string) (string, error) {
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// skip common volatile files
+		base := filepath.Base(path)
+		if base == ".DS_Store" || base == "Thumbs.db" {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(files)
+	h := sha1.New()
+	for _, f := range files {
+		rel, _ := filepath.Rel(dir, f)
+		// include filename to avoid collisions
+		if _, err := h.Write([]byte(rel)); err != nil {
+			return "", err
+		}
+		if _, err := h.Write([]byte{0}); err != nil {
+			return "", err
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return "", err
+		}
+		if _, err := h.Write(data); err != nil {
+			return "", err
+		}
+		if _, err := h.Write([]byte{0}); err != nil {
+			return "", err
+		}
+	}
+	sum := h.Sum(nil)
+	return fmt.Sprintf("%x", sum), nil
+}
+
+// resolveRequirements recursively resolves all plugin requirements
+func resolveRequirements(baselinePlugins, customPlugins, storefrontPlugins []Plugin) ([]Plugin, error) {
+	seen := make(map[string]bool)
+	result := make([]Plugin, 0)
+	queue := make([]Plugin, 0)
+	dependencyTree := make(map[string][]string)
+	sourceMap := make(map[string]string)
+
+	// Helper to add plugins from a source
+	addPlugins := func(plugins []Plugin, source string) {
+		for _, p := range plugins {
+			key := p.Vendor + "/" + p.Name
+			if !seen[key] {
+				p.Source = source
+				seen[key] = true
+				queue = append(queue, p)
+				sourceMap[key] = source
+			}
+		}
+	}
+
+	// Add plugins in priority order
+	addPlugins(baselinePlugins, "baseline")
+	addPlugins(customPlugins, "custom")
+	addPlugins(storefrontPlugins, "storefront")
+
+	// BFS traversal to resolve all dependencies
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		result = append(result, current)
+
+		currentKey := current.Vendor + "/" + current.Name
+
+		// Try to read plugin.json for requirements
+		meta, err := readPluginMeta(current.Vendor, current.Name)
+		if err != nil {
+			// Plugin not yet downloaded, will be downloaded in install phase
+			continue
+		}
+
+		// Process requirements
+		for _, req := range meta.Requirements {
+			vendor, name, ok := parsePluginURL(req)
+			if !ok {
+				fmt.Printf("Warning: invalid requirement URL: %s\n", req)
+				continue
+			}
+
+			key := vendor + "/" + name
+			dependencyTree[currentKey] = append(dependencyTree[currentKey], key)
+
+			if seen[key] {
+				continue // Already processed or queued
+			}
+
+			seen[key] = true
+			newPlugin := Plugin{
+				Vendor:  vendor,
+				Name:    name,
+				Version: "latest",
+				Source:  currentKey,
+			}
+			sourceMap[key] = currentKey
+			queue = append(queue, newPlugin)
+			fmt.Printf("  [%s] requires → %s\n", currentKey, key)
+		}
+	}
+
+	// Print dependency tree with sources
+	if len(dependencyTree) > 0 {
+		fmt.Println("\n==> Dependency Tree:")
+		visited := make(map[string]bool)
+
+		printTree := func(plugins []Plugin, label string) {
+			if len(plugins) > 0 {
+				fmt.Printf("\n📦 FROM %s:\n", label)
+				for _, root := range plugins {
+					key := root.Vendor + "/" + root.Name
+					printNodeWithSource(dependencyTree, sourceMap, key, "  ", visited, true, true)
+				}
+			}
+		}
+
+		printTree(baselinePlugins, "baseline/plugins.json")
+		printTree(customPlugins, "custom/plugins.json")
+		printTree(storefrontPlugins, "storefront/plugins.json")
+	}
+
+	return result, nil
+}
+
+// printNodeWithSource prints a visual tree node with source information
+func printNodeWithSource(tree map[string][]string, sourceMap map[string]string, key string, prefix string, visited map[string]bool, isLast bool, isRoot bool) {
+	marker := "├──"
+	if isLast {
+		marker = "└──"
+	}
+
+	if isRoot {
+		fmt.Printf("%s%s\n", prefix, key)
+	} else {
+		source := sourceMap[key]
+		sourceLabel := ""
+		if source != "" && source != "baseline" && source != "custom" && source != "storefront" {
+			sourceLabel = fmt.Sprintf(" (required by: %s)", source)
+		}
+		fmt.Printf("%s%s %s%s\n", prefix, marker, key, sourceLabel)
+	}
+
+	children := tree[key]
+	if len(children) == 0 {
+		return
+	}
+
+	// Prevent infinite recursion on circular dependencies
+	if visited[key] {
+		return
+	}
+	visited[key] = true
+
+	newPrefix := prefix
+	if isLast {
+		newPrefix += "    "
+	} else {
+		newPrefix += "│   "
+	}
+
+	for i, child := range children {
+		printNodeWithSource(tree, sourceMap, child, newPrefix, visited, i == len(children)-1, false)
+	}
+}
+
+// Step 1: mergePlugins merges baseline, custom and storefront plugins and resolves requirements
+func mergePlugins() error {
 	baselinePlugins, err := readPluginsFromFile("baseline/plugins.json")
 	if err != nil {
 		return fmt.Errorf("error reading baseline/plugins.json: %v", err)
@@ -239,33 +479,28 @@ func mergePlugins() error {
 		return fmt.Errorf("error reading custom/plugins.json: %v", err)
 	}
 
-	merged := append(baselinePlugins, customPlugins...)
-
-	unique := make(map[string]Plugin)
-	for _, p := range merged {
-		key := p.Name + ":" + p.Vendor
-		unique[key] = Plugin{
-			Version: p.Version,
-			Name:    p.Name,
-			Vendor:  p.Vendor,
+	storefrontPlugins, err := readPluginsFromFile("storefront/plugins.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			storefrontPlugins = []Plugin{}
+		} else {
+			return fmt.Errorf("error reading storefront/plugins.json: %v", err)
 		}
 	}
 
-	// Convert map to slice
-	result := make([]Plugin, 0, len(unique))
-	for _, p := range unique {
-		result = append(result, p)
+	fmt.Printf("Loaded %d plugins from baseline/plugins.json\n", len(baselinePlugins))
+	fmt.Printf("Loaded %d plugins from custom/plugins.json\n", len(customPlugins))
+	fmt.Printf("Loaded %d plugins from storefront/plugins.json\n", len(storefrontPlugins))
+
+	// Resolve all requirements recursively
+	resolved, err := resolveRequirements(baselinePlugins, customPlugins, storefrontPlugins)
+	if err != nil {
+		return fmt.Errorf("error resolving requirements: %v", err)
 	}
 
-	// Sort alphabetically by vendor, then by name
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Vendor == result[j].Vendor {
-			return result[i].Name < result[j].Name
-		}
-		return result[i].Vendor < result[j].Vendor
-	})
+	fmt.Printf("\nTotal plugins after resolving requirements: %d\n", len(resolved))
 
-	out, err := json.MarshalIndent(result, "", "  ")
+	out, err := json.MarshalIndent(resolved, "", "  ")
 	if err != nil {
 		return fmt.Errorf("error marshaling merged plugins: %v", err)
 	}
@@ -280,16 +515,15 @@ func mergePlugins() error {
 		return fmt.Errorf("error writing to %s: %v", outputFile, err)
 	}
 
-	fmt.Printf("Unique merged plugin list written to %s\n", outputFile)
 	return nil
 }
 
 // Step 2: installPlugins downloads and installs plugins from the installed.json file
+// Clean, minimal output: per plugin two lines:
+// vendor/name version=<resolved-version>
+// status: <http-status-code>
 func installPlugins() error {
-	fmt.Println("\n==> Step 2: Installing plugins")
-
 	installedPath := ".plugins/installed.json"
-	fmt.Printf("[debug] reading installed plugins file: %s\n", installedPath)
 	pluginsJSON, err := os.ReadFile(installedPath)
 	if err != nil {
 		return fmt.Errorf("error reading installed plugins file: %v", err)
@@ -299,71 +533,91 @@ func installPlugins() error {
 	if err := json.Unmarshal(pluginsJSON, &plugins); err != nil {
 		return fmt.Errorf("error parsing plugins JSON: %v", err)
 	}
-	fmt.Printf("[debug] parsed %d plugins from %s\n", len(plugins), installedPath)
-	for i, p := range plugins {
-		fmt.Printf("[debug] plugin[%d] = %+v\n", i, p)
-	}
 
 	cacheDir := ".plugins/cache"
-	fmt.Printf("[debug] ensuring cache dir exists: %s\n", cacheDir)
 	if err := os.MkdirAll(cacheDir, os.ModePerm); err != nil {
 		return fmt.Errorf("error creating cache directory: %v", err)
 	}
 
-	for _, plugin := range plugins {
-		fmt.Printf("[debug] processing plugin: vendor=%s name=%s version=%s\n", plugin.Vendor, plugin.Name, plugin.Version)
+	for i := range plugins {
+		plugin := &plugins[i]
 		pluginVersion := plugin.Version
-		// Remove v- prefix if it exists and version is "v-latest" or "v-LATEST" etc
+
 		if strings.ToLower(pluginVersion) == "v-latest" {
-			fmt.Printf("[debug] normalizing v-latest -> latest for %s/%s\n", plugin.Vendor, plugin.Name)
 			pluginVersion = "latest"
 		}
-		if isSpecialLatestVersion(pluginVersion) {
-			fmt.Printf("[debug] pluginVersion %q considered special/latest for %s/%s\n", pluginVersion, plugin.Vendor, plugin.Name)
-			ver, err := FetchLatestVersion(plugin.Vendor, plugin.Name)
-			if err != nil {
-				return fmt.Errorf("failed to fetch latest version for %s/%s: %v", plugin.Vendor, plugin.Name, err)
-			}
-			pluginVersion = ver
-			fmt.Printf("[debug] Resolved latest version for %s/%s: %s\n", plugin.Vendor, plugin.Name, pluginVersion)
-		}
+		// Don't check if latest exists, just try to download it
+		plugin.Version = pluginVersion
 
 		url := fmt.Sprintf("https://download.pocketstore.io/d/plugins/%s/%s/%s.zip", plugin.Vendor, plugin.Name, pluginVersion)
 		zipPath := filepath.Join(cacheDir, fmt.Sprintf("%s-%s-%s.zip", plugin.Vendor, plugin.Name, pluginVersion))
-
-		// Ensure each plugin is extracted into its own directory under .plugins/repos/<vendor>/<name>
 		destDir := filepath.Join(".plugins", "repos", plugin.Vendor, plugin.Name)
-		fmt.Printf("[debug] plugin destination dir: %s\n", destDir)
 
-		// Remove any existing contents in the plugin destDir so old files do not persist
-		if err := os.RemoveAll(destDir); err != nil {
-			// Non-fatal: warn and continue
-			fmt.Printf("[warn] failed to remove existing dest dir %s: %v\n", destDir, err)
-		}
+		_ = os.RemoveAll(destDir)
 
-		fmt.Printf("[info] Downloading %s...\n", url)
-		if err := DownloadFile(zipPath, url); err != nil {
+		_, err := DownloadFile(zipPath, url)
+		if err != nil {
 			_ = os.Remove(zipPath)
 			return fmt.Errorf("failed to download %s: %v", url, err)
 		}
 
-		fmt.Printf("[info] Unzipping to %s...\n", destDir)
 		if err := Unzip(zipPath, destDir); err != nil {
 			_ = os.Remove(zipPath)
 			_ = os.RemoveAll(destDir)
 			return fmt.Errorf("failed to unzip %s: %v", zipPath, err)
 		}
 
-		fmt.Printf("[info] Installed %s/%s %s into %s\n", plugin.Vendor, plugin.Name, pluginVersion, destDir)
+		// Attempt to determine revision/commit hash:
+		// Priority:
+		// 1) plugin.json "revision" (already handled below)
+		// 2) .git/HEAD ref inside the extracted destDir (if present)
+		// 3) deterministic SHA1 computed from files as a fallback
+		pluginJSONPath := filepath.Join(destDir, "plugin.json")
+		if exists(pluginJSONPath) {
+			if pj, err := readPluginMeta(plugin.Vendor, plugin.Name); err == nil {
+				if pj.Revision != "" {
+					plugin.Revision = pj.Revision
+				} else if pj.Version != "" {
+					// keep previous behavior: use version if provided as fallback
+					plugin.Revision = pj.Version
+				}
+				if pj.Version != "" {
+					plugin.Version = pj.Version
+				}
+			}
+		}
+
+		if plugin.Revision == "" {
+			// try to read .git metadata if the zip included it
+			if rev := tryReadGitHead(destDir); rev != "" {
+				plugin.Revision = rev
+			}
+		}
+		if plugin.Revision == "" {
+			// fallback to deterministic dir hash
+			if rev, err := computeDirSHA1(destDir); err == nil {
+				plugin.Revision = rev
+			}
+		}
+
+		// One-line success output
+		fmt.Printf("✓ %s/%s (version=%s)\n", plugin.Vendor, plugin.Name, plugin.Version)
 	}
+
+	// Write back resolved metadata INCLUDING revision field
+	out, err := json.MarshalIndent(plugins, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling updated installed plugins: %v", err)
+	}
+	if err := os.WriteFile(installedPath, out, 0644); err != nil {
+		return fmt.Errorf("error writing updated installed plugins to %s: %v", installedPath, err)
+	}
+
 	return nil
 }
 
 // Step 3: mergePluginFiles merges plugin files into the storefront directory
 func mergePluginFiles() error {
-	fmt.Println("\n==> Step 3: Merging plugin files")
-
-	fmt.Println("Reading plugin root directory:", pluginRoot)
 	vendorDirs, err := os.ReadDir(pluginRoot)
 	if err != nil {
 		return fmt.Errorf("failed to read plugin root: %v", err)
@@ -380,7 +634,7 @@ func mergePluginFiles() error {
 
 		pluginJsonPath := filepath.Join(vendorPath, "plugin.json")
 		if exists(pluginJsonPath) {
-			prio := readPrio(pluginJsonPath)
+			prio := readPrio("", vendorEntry.Name())
 			plugins = append(plugins, Plugin{
 				Vendor:   "",
 				Name:     vendorEntry.Name(),
@@ -402,7 +656,7 @@ func mergePluginFiles() error {
 			pluginPath := filepath.Join(vendorPath, p.Name())
 			pluginJsonPath := filepath.Join(pluginPath, "plugin.json")
 			if exists(pluginJsonPath) {
-				prio := readPrio(pluginJsonPath)
+				prio := readPrio(vendorEntry.Name(), p.Name())
 				plugins = append(plugins, Plugin{
 					Vendor:   vendorEntry.Name(),
 					Name:     p.Name(),
@@ -420,8 +674,6 @@ func mergePluginFiles() error {
 
 	// Copy folders for each plugin
 	for _, plugin := range plugins {
-		fmt.Printf("Processing plugin: %s/%s (prio: %d)\n", plugin.Vendor, plugin.Name, plugin.Prio)
-
 		for _, d := range dirsToCopy {
 			src := filepath.Join(plugin.BasePath, d)
 
@@ -435,13 +687,12 @@ func mergePluginFiles() error {
 
 			if exists(src) {
 				finalDst := filepath.Join("storefront", dst)
-				fmt.Printf("  Copying %s → %s\n", src, finalDst)
-
 				if err := copyDir(src, finalDst); err != nil {
 					fmt.Printf("  Error copying %s: %v\n", d, err)
 				}
 			}
 		}
+		fmt.Printf("✓ %s/%s (prio: %d)\n", plugin.Vendor, plugin.Name, plugin.Prio)
 	}
 	return nil
 }
@@ -453,17 +704,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Step 2: Install plugins
+	// Step 2: Install plugins (clean output)
 	if err := installPlugins(); err != nil {
 		fmt.Fprintf(os.Stderr, "FAILED: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Step 3: Merge plugin files into storefront
+	fmt.Println("\n==> Merging plugin files into storefront")
 	if err := mergePluginFiles(); err != nil {
 		fmt.Fprintf(os.Stderr, "FAILED: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Println("\n==> All plugin steps complete!")
 }
